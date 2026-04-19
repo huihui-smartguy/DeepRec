@@ -4,6 +4,7 @@ import copy
 from typing import Dict, Any
 from data import UserProfile, BEHAVIOR_LOG, USER_QUERY, PRODUCTS, WANG_FINAL_REPLY
 from bandits import causal_debias, implicit_feedback, llm_prior, nonstationary, slate_ccb, generative_arm
+import nlu
 
 
 def stage_4_evolution(profile: UserProfile,
@@ -21,10 +22,15 @@ def stage_4_evolution(profile: UserProfile,
         print(f"│  · 忽略产品: {WANG_FINAL_REPLY['ignored']}")
         print(f"│  · 文本回复: \"{WANG_FINAL_REPLY['text']}\"")
 
+    # NLU: 工业化版本通过 LLM/正则实时抽取槽位, 而非硬编码
+    if verbose:
+        print("│  ── NLU 槽位抽取 ──")
+    slots = nlu.extract_slots(WANG_FINAL_REPLY["text"], verbose=verbose)
+
     # 后验更新：在 budget 维度上使用闭式高斯-高斯共轭
     prior_mu = llm_prior_dist["annual_budget"]["mu"]
     prior_sigma = llm_prior_dist["annual_budget"]["sigma"]
-    obs_mu = WANG_FINAL_REPLY["extracted"]["annual_budget"]
+    obs_mu = slots.get("annual_budget") or prior_mu  # NLU 抽不到则不更新
     obs_sigma = 1_500  # 客户口语回答的等效观测噪声
 
     post_var = 1 / (1 / prior_sigma**2 + 1 / obs_sigma**2)

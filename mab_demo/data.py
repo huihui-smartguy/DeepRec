@@ -132,12 +132,9 @@ PRODUCTS: List[Dict[str, Any]] = [
 
 
 # 王女士在第三轮交互后的真实答复（用于阶段四闭环）
+# 注意: extracted 字段在工业化版本中不再硬编码, 改由 nlu.extract_slots(text) 实时抽取
 WANG_FINAL_REPLY = {
     "clicked": "P006",          # 点击了 1.5w 的 A 卡片
     "ignored": "P007",          # 无视了 3w 的 B 卡片
     "text": "差不多每年 2 万吧, 别亏钱。",
-    "extracted": {              # NLU 模块解析后的结构化槽位
-        "annual_budget": 20_000,
-        "loss_aversion": True,
-    },
 }

@@ -1,35 +1,129 @@
-# 金融场景 MAB Demo · 代码架构说明文档
+# 金融场景 MAB Demo · 代码架构说明文档（工业化版本）
 
 ## 一、设计目标
 
-把《金融场景MAB技术应用设计文档.md》中的"四阶段融合架构"完整落地为一个**可独立运行、可观测、可对比**的 Python 后端 demo。
+把《金融场景MAB技术应用设计文档.md》中的"四阶段融合架构"完整落地为一个**可独立运行、可观测、可对比、支持真实 LLM 接入**的 Python 后端 demo。
 
 具体目标：
 1. 复现王女士 case 中"画像-意图冲突 + 兴趣漂移 + 隐式负反馈"三大典型噪声。
 2. 串联 6 种 MAB 技术（因果去偏 / 隐式负反馈 / LLM 先验 / 非平稳衰减 / 对话式组合 / 大模型生臂），按业务流自然解决冲突。
 3. 提供"原始画像 vs 增强画像"的量化对比，证明 MAB 的有效性（命中率从 0% 提升至 91%）。
+4. **支持真实 LLM（DeepSeek/Qwen/vLLM/OpenAI）接入，全链路带 Schema 校验与优雅降级**。
 
 ## 二、目录结构
 
 ```
 mab_demo/
-├── data.py                       # 王女士原始画像、行为流、产品库、最终回复
-├── bandits/                      # 六种 MAB 算法
+├── config.py                     # 全局配置: 所有环境变量集中管理
+├── schemas.py                    # LLM JSON 输出严格校验(防幻觉炸管道)
+├── nlu.py                        # NLU 槽位抽取(LLM + 正则兜底)
+├── data.py                       # 王女士画像/行为流/产品库/最终回复
+├── clients/                      # 基础设施层
 │   ├── __init__.py
-│   ├── causal_debias.py          # 阶段一·算法1: 因果去偏
-│   ├── implicit_feedback.py      # 阶段一·算法2: 隐式负反馈
-│   ├── llm_prior.py              # 阶段二·算法1: LLM 生成先验分布
-│   ├── nonstationary.py          # 阶段二·算法2: 非平稳衰减
-│   ├── slate_ccb.py              # 阶段三·算法1: 对话式组合 MAB
-│   └── generative_arm.py         # 阶段三·算法2: 大模型动态生臂
-├── orchestrator.py               # 四阶段流水线编排 + 阶段四闭环进化
-├── profile_compare.py            # 原始画像 vs 增强画像 对比报告
+│   ├── llm_client.py             # OpenAI 兼容客户端(retry/cache/timeout/降级)
+│   └── reward_model.py           # 可插拔奖励模型(rule/llm_judge/external)
+├── prompts/                      # Prompt 模板(版本化)
+│   ├── llm_prior.py
+│   ├── generative_arm.py
+│   └── nlu.py
+├── bandits/                      # 6 种 MAB 算法
+│   ├── causal_debias.py          # 阶段一·算法1(规则 + 可选 LLM 兜底)
+│   ├── implicit_feedback.py      # 阶段一·算法2
+│   ├── llm_prior.py              # 阶段二·算法1(真 LLM + Mock 降级)
+│   ├── nonstationary.py          # 阶段二·算法2
+│   ├── slate_ccb.py              # 阶段三·算法1
+│   └── generative_arm.py         # 阶段三·算法2(真 LLM + Mock 降级)
+├── orchestrator.py               # 四阶段流水线 + 阶段四闭环进化(含 NLU)
+├── profile_compare.py            # 原始 vs 增强画像对比
 ├── run_demo.py                   # 主入口
+├── tests/
+│   └── test_llm_path.py          # 伪造 LLM 响应, 验证真实路径可通
+├── requirements.txt              # 可选依赖(openai)
 ├── ARCHITECTURE.md               # 本文档
 └── README.md                     # 使用说明
 ```
 
-## 三、四阶段流水线（与设计文档对应）
+## 三、工业化架构分层
+
+```
+┌──────────────── 业务编排层 ─────────────────┐
+│  orchestrator.py  ·  run_pipeline()          │
+└──────────┬──────────────────────────────────┘
+           │ 调用
+┌──────────▼──── 算法层 (6 种 MAB) ────────────┐
+│  bandits/causal_debias       (规则为主)       │
+│  bandits/implicit_feedback   (纯算法)         │
+│  bandits/llm_prior           (LLM)            │
+│  bandits/nonstationary       (纯算法)         │
+│  bandits/slate_ccb           (纯算法)         │
+│  bandits/generative_arm      (LLM + RM)       │
+│  nlu.extract_slots           (LLM + 正则)     │
+└──────────┬──────────────────────────────────┘
+           │ 调用
+┌──────────▼──── 基础设施层 ────────────────────┐
+│  clients/llm_client     OpenAI 兼容客户端     │
+│  clients/reward_model   可插拔 RM              │
+│  schemas                JSON Schema 校验器     │
+│  prompts                Prompt 模板(版本化)    │
+│  config                 环境变量聚合           │
+└─────────────────────────────────────────────┘
+```
+
+## 四、LLM 接入点与降级路径
+
+| # | 模块 | Mock → LLM 改造位置 | 降级策略 |
+|---|---|---|---|
+| 1 | 阶段二·先验分布 | `bandits/llm_prior.py:_llm_reasoning_real` | 失败 → 常识推理 Mock |
+| 2 | 阶段三·生臂 | `bandits/generative_arm.py:_generate_candidates_real` | 失败 → 固定 4 条模板 |
+| 3 | 阶段三·RM 打分 | `clients/reward_model.py:get_reward_model` | 默认规则 RM；可切 LLM Judge / External RM |
+| 4 | 阶段四·NLU 抽槽 | `nlu.extract_slots` | 失败 → 正则抽取 |
+| 5 | 阶段一·因果分类 | `bandits/causal_debias._llm_classify_confounder` | 默认关闭；启用后失败 → 规则兜底 |
+
+**降级原则**：任何一层 LLM 失败都不会让主流程断链。`CONFIG.fallback_on_fail=True`（默认）时自动兜底。
+
+## 五、关键设计决策
+
+### 5.1 Schema 严格校验
+
+LLM 返回后必须经 [`schemas.py`](schemas.py) 验证：
+- 字段完整性（缺必要字段直接拒绝）
+- 类型正确性
+- 数值在业务合理区间（如 `term_years ∈ [0.1, 40]`，`risk` 概率之和 ≈ 1）
+- 非法输出 → `SchemaError` → 上层走降级路径
+
+**业务价值**：一次 LLM 幻觉（比如 `term_years=999`）可能让后续所有维度方差炸掉。Schema 层是必不可少的护城河。
+
+### 5.2 进程内缓存
+
+`LLMClient._cache` 按 `sha256(prompt + model + temperature + system)` 做幂等缓存：
+- 命中率估计：相同客户主诉下的先验调用约 40-60% 命中
+- 生产环境建议替换为 Redis，TTL 设 1-6 小时
+
+### 5.3 Prompt 版本化
+
+每个 prompt 模板都有 `VERSION` 字段（`prompts/llm_prior.py:4` 等），运行时会打印：
+```
+Prompt 版本: v1.0.2026-04-19
+```
+生产必备：改 prompt 必改版本号，方便监控 A/B 测试命中率变化。
+
+### 5.4 可插拔奖励模型
+
+通过环境变量 `MAB_RM_TYPE` 切换：
+```
+rule_based    (默认)     规则匹配 + 长度奖励, <1ms
+llm_judge     (离线评估)  LLM 当 Judge, ~500ms, 仅测试用
+external_rm   (生产推荐)  专用 RM 推理服务, <10ms
+```
+
+### 5.5 重试与超时
+
+`LLMClient.chat_json` 的重试逻辑：
+- 指数退避：`0.5 * 2^attempt`，最多 2s
+- 默认 2 次重试（可配 `MAB_LLM_RETRIES`）
+- 区分 JSON 解析失败 与 网络失败，分别打日志
+
+## 六、四阶段流水线（与设计文档对应）
 
 ```
 ┌─────────┐  阶段一: 入场洗数  ┌────────────┐  阶段二: 零样本定调  ┌──────────┐
@@ -42,137 +136,80 @@ mab_demo/
        阶段四: 闭环进化         阶段三: 组合生臂                       │
    ┌──────────┐  ⑦ 贝叶斯  ┌────────────┐                              │
    │ 增强画像 │ ◀────── ── │ 用户回复   │ ◀── ⑥ 大模型生臂 ── ⑤ Slate-CCB
-   │ (固化)   │   后验    │ + 点击     │     高情商追问       2 产品 + 1 追问
+   │ (固化)   │   后验    │ ⑧ NLU 抽槽 │     高情商追问       2 产品 + 1 追问
    └──────────┘           └────────────┘
 ```
 
-## 四、模块职责与算法实现要点
+## 七、运行方式
 
-### 阶段一·算法1：`bandits/causal_debias.py` 因果去偏 MAB
+### 7.1 不接 LLM（零依赖）
+```bash
+cd mab_demo && python3 run_demo.py
+```
+所有 LLM 节点自动降级到 Mock，输出与前版完全一致。
 
-- **输入**：6 条原始行为事件
-- **算法**：基于因果规则集（`source_module`、`action`、`note` 等元数据）识别"看似有意图、实则是路径噪音"的混淆变量（Confounder）
-- **关键规则**：
-  - `source_module == "我的持仓"` → 持仓回看，非购买意图
-  - `底部导航 + click_tab` → 路径噪音
-  - `note 中含"随便看看"` → 浏览惯性
-- **输出**：`(clean_events, confounders)`，将 6 条 → 3 条真因果事件
+### 7.2 接入 DeepSeek / Qwen / OpenAI
+```bash
+pip install -r requirements.txt
+export MAB_LLM_API_KEY=sk-xxx
+export MAB_LLM_BASE_URL=https://api.deepseek.com/v1   # 或其他
+export MAB_LLM_MODEL=deepseek-chat
+python3 run_demo.py
+```
+输出中会看到：
+```
+推理来源: LLM
+生成来源: LLM
+[NLU·LLM] 抽取槽位: {...}
+```
 
-### 阶段一·算法2：`bandits/implicit_feedback.py` 隐式负反馈 MAB
+### 7.3 接入本地 vLLM
+```bash
+# 先起 vLLM: python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B
+export MAB_LLM_API_KEY=dummy
+export MAB_LLM_BASE_URL=http://localhost:8000/v1
+export MAB_LLM_MODEL=Qwen/Qwen2.5-7B
+```
 
-- **输入**：清洗后的真因果事件
-- **算法**：
-  - 检测 `dwell_seconds < 5` 或 `quick_exit=True` → 秒退（reward = -1.0）
-  - 检测 `silent_ignore=True` → 主动划过（reward = -0.8，扣到 risk 维度）
-  - **因果归因**：秒退的根因往往集中在某一维度。用"教育金常识基线"反查偏离最大的维度（min_invest 或 term）作为主责，主责扣 -1.0，次责扣 -0.2。
-- **输出**：`penalty[dim][bucket] = 累计 reward`
-- **关键设计**：不直接扣 risk 维度（risk 由阶段二的 LLM 先验和非平稳处理）
+### 7.4 测试 LLM 路径（无需真实 API key）
+```bash
+python3 tests/test_llm_path.py
+```
+用 FakeLLMClient monkey-patch，验证所有 LLM 调用点的代码路径 + Schema 校验。
 
-### 阶段二·算法1：`bandits/llm_prior.py` LLM 生成先验分布
+## 八、可观测性
 
-- **输入**：静态画像 + 主诉文本
-- **算法（mock 的 LLM 推理）**：
-  - 从家庭结构推理出周期：5 岁子女 → 17 年到大学（取 15 年作为定投基金主流周期）
-  - 从年收入推理预算：60 万 × 3-5% = 1.8-3 万/年
-  - 从教育金常识推理风险偏好：本金安全 > 高收益 → R1 主导
-- **输出**：高斯/分类先验
-  ```python
-  prior["term_years"]    = N(μ=15, σ=2)
-  prior["annual_budget"] = N(μ=24000, σ=6000)
-  prior["risk"]          = {R1:0.55, R2:0.35, R3:0.08, R4:0.02}
-  ```
-- **价值**：MAB 跳过冷启动盲盒试错，第一轮就锁定优质区域
+所有算法默认 `verbose=True`，每个阶段都打印：
+- Prompt 版本号
+- LLM 调用来源（LLM / Mock + 降级原因）
+- 中间矩阵（惩罚表、先验分布、EIG 分数等）
+- 决策依据（为什么选这个组合）
 
-### 阶段二·算法2：`bandits/nonstationary.py` 非平稳衰减 MAB
+方便业务方做白盒验证，也便于生产出错时快速定位是哪一层降级了。
 
-- **输入**：静态画像 + LLM 先验 + 隐式负反馈惩罚
-- **算法**：
-  1. 计算 `KL(LLM_prior || historical)` 作为概念漂移强度
-  2. 若 KL > 阈值 0.4，触发衰减
-  3. 用 `α = sigmoid(1.5 * (KL - 0.4))` 生成历史/先验融合权重
-  4. `fused[k] = (1-α) * historical[k] + α * llm_prior[k]`
-  5. 叠加显式负反馈：若该 risk 等级被主动划过（penalty ≤ -0.5），额外乘 0.05 二次压制
-- **输出**：风险维度后验分布
-- **效果**：王女士的 KL = 1.408 → α = 0.819 → R3 从 0.60 → 0.18，R1 从 0.05 → 0.48
+## 九、生产落地的剩余改造项
 
-### 阶段三·算法1：`bandits/slate_ccb.py` 对话式组合 MAB (Slate-CCB)
-
-- **输入**：完整产品库 + 当前 MAB 状态（先验 + 衰减后风险）+ 隐式负反馈惩罚
-- **算法**：
-  1. **Step 1 隐式负反馈硬过滤**：剔除被打到 -0.8 以下的金额段、期限段
-  2. **Step 2 质量底线过滤**：`base_quality(p) = term_match × risk_match ≥ 0.18`，确保两款产品都满足"教育金 must-have"
-  3. **Step 3 ask 维度选择**：在 budget/term/risk 中选不确定性最大的维度作为追问目标
-  4. **Step 4 组合臂枚举**：对每个 (a, b) 配对计算
-     ```
-     score = 0.55 · avg_quality + 0.30 · budget_coverage + 0.15 · straddle
-     ```
-     其中 `straddle` 奖励"一上一下跨越 budget 均值"的组合（最大化预算维度上的二分查找信息增益）
-- **输出**：`{exploit, explore, ask_dim, eig, score}`
-- **效果**：选出 P006 (1.5万) [利用臂] + P007 (3万) [探索臂] + ask_dim=budget，与设计文档完全一致
-
-### 阶段三·算法2：`bandits/generative_arm.py` 大模型动态生臂 (Generative Arms)
-
-- **输入**：Slate-CCB 输出的硬核机器指令
-- **算法**：
-  1. LLM 实时生成 4 个候选追问臂（mock 为固定 4 句话，对应不同语气策略）
-  2. 每个臂用三个子分打分：
-     - `empathy`：是否包含痛点关键词（王女士、宝宝、品质生活、节奏…）
-     - `precision`：是否同时锚定 A、B 两个具体金额
-     - `conciseness`：长度奖励（100-180 字最佳）
-  3. `total = 0.5 × empathy + 0.3 × precision + 0.2 × conciseness`
-- **输出**：得分最高的追问话术
-- **效果**：选中 ARM_3 «高情商 + 锚点 + 痛点回应» (total=0.917)
-
-### 阶段四：`orchestrator.stage_4_evolution` 闭环进化
-
-- **输入**：客户的真实回复（点击 P006 / 忽略 P007 / 文本"差不多每年 2 万吧, 别亏钱"）
-- **算法**：
-  1. **annual_budget 维度**：高斯-高斯共轭后验
-     ```
-     posterior_var = 1 / (1/prior_var + 1/obs_var)
-     posterior_mu  = posterior_var · (prior_mu/prior_var + obs_mu/obs_var)
-     ```
-  2. **term 维度**：客户点击 P006(15年) → 强确认 → σ 直接坍缩到 0.5
-  3. **risk 维度**：点 R1 / 忽略 R2 → R1 概率压倒性提升
-- **输出**：固化的增强画像 `UserProfile`，置信度 0.97
-
-## 五、原始画像 vs 增强画像 对比器
-
-`profile_compare.py` 提供量化对比：
-
-| 维度 | 原始画像 | 增强后 | 增益 |
-|---|---|---|---|
-| 画像置信度 | 0.35 | 0.97 | +62% |
-| 意图标签 | 短期理财 | 子女教育金·15年定投·R1保本 | ✓ 已识别 |
-| 风险 R1 | 0.05 | 0.93 | 主导反转 |
-| 风险 R3 | 0.60 | 0.00 | 旧主导坍缩 |
-| 期限 μ (年) | 0.5 | 15.0 | 跨越 30 倍 |
-| 年预算 σ (元) | 20,000 | 1,455 | 缩 13.7x |
-| **目标产品命中率** | **0.00%** | **91.33%** | **从不可能到必然** |
-
-## 六、技术栈与运行环境
-
-- **语言**：Python 3.7+
-- **依赖**：纯标准库（`math`、`itertools`、`collections`、`dataclasses`），无第三方依赖
-- **运行**：`cd mab_demo && python3 run_demo.py`
-- **可观测性**：所有算法默认 `verbose=True`，每个阶段都打印中间状态、矩阵、决策依据，方便业务方做白盒验证
-
-## 七、与生产环境的差异
-
-为了 demo 简洁，以下环节做了简化：
-
-| 模块 | Demo 简化 | 生产实现建议 |
+| 项目 | Demo 实现 | 生产建议 |
 |---|---|---|
-| LLM 推理 | 硬编码确定性 mock | DeepSeek-V3 / Qwen-Max + vLLM, 输出 JSON 先验 |
-| 因果归因 | 规则集 | DML/双重机器学习 / Causal Forest |
-| 隐式负反馈检测 | dwell + flag | Flink 实时窗口 + Bayesian Surprise |
-| Slate 枚举 | O(n²) 暴力 | LinUCB / NeuralUCB + 分层树 Bandit |
-| 生臂打分 | 关键词匹配 | Reward Model (RLHF 训练的小模型) |
-| 后验更新 | 解析高斯共轭 | NUTS 采样 / Variational Inference |
+| LLM 客户端 | 单例 OpenAI SDK | + 连接池 + gRPC 双通道 + 负载均衡 |
+| 缓存 | 进程内 dict | Redis Cluster with TTL |
+| Schema 校验 | 手写 validator | Pydantic v2 + 自动代码生成 |
+| 因果归因 | 规则 + LLM 兜底 | DML/双重机器学习, Causal Forest |
+| RM 打分 | 规则 | 离线训练 DeBERTa-RM, 量化 INT8 部署 |
+| 监控 | print + logging | OpenTelemetry + Prometheus |
+| Prompt 管理 | 代码内常量 | PromptOps 平台(版本/灰度/回滚) |
+| 降级开关 | 全局 flag | 多级熔断(Hystrix 模式) |
 
-## 八、可扩展点
+## 十、与原版 Demo 的差异
 
-1. **新增 case**：在 `data.py` 增加新的 `UserProfile` 与 `BEHAVIOR_LOG`，主流程无需修改
-2. **新增 MAB 算法**：在 `bandits/` 下新增模块，在 `orchestrator.run_pipeline` 中插入调用
-3. **接入真实 LLM**：替换 `bandits/llm_prior.py` 与 `bandits/generative_arm.py` 中的 mock 函数
-4. **多用户对比**：批量跑 `run_pipeline` 输出聚合命中率指标
+| 维度 | 原 Demo (v1) | 工业化版 (v2) |
+|---|---|---|
+| LLM 调用 | 纯 Mock | LLM + Mock 双路径 |
+| JSON 校验 | 无 | `schemas.py` 严格校验 |
+| Prompt | 硬编码 | 版本化模板 |
+| RM | 规则内联 | 可插拔接口 |
+| NLU | 硬编码结果 | LLM + 正则兜底 |
+| 因果归因 | 3 条规则 | 规则 + 可选 LLM 兜底 |
+| 可观测性 | 基础打印 | + Prompt 版本、调用来源、降级原因 |
+| 测试 | 无 | `tests/test_llm_path.py` |
+| 依赖 | 零 | 可选 openai (不装也能跑) |

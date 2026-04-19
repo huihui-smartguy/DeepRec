@@ -1,17 +1,50 @@
 """阶段二·算法1：大模型生成先验分布 (LLM-Generated Priors)
 
-打破 MAB 冷启动盲盒。让 LLM 基于静态画像 + 主诉, 通过常识推理生成先验分布矩阵,
-直接注入 MAB, 让其第一轮探索就锁定优质区域。
+工业化版本:
+  - 主路径: 调真实 LLM (OpenAI/DeepSeek/Qwen/vLLM 均兼容), 严格 JSON 校验
+  - 降级路径: LLM 不可用 / 校验失败 时, 回退到常识推理 mock, 保证 demo 可跑
 
-本 demo 中 LLM 推理被 mock 成确定性逻辑（保证可复现）。
-真实工业实现：LLM 输出 JSON, 包含每个维度的(均值/方差/类别概率)。
+打破 MAB 冷启动盲盒, 让 MAB 第一轮就锁定优质区域。
 """
-from typing import Dict, Any
+import logging
+from typing import Any, Dict
+
+from clients.llm_client import llm_client
+from config import CONFIG
 from data import UserProfile
+from prompts.llm_prior import PRIOR_PROMPT, PRIOR_SYSTEM, VERSION
+from schemas import SchemaError, validate_llm_prior
+
+log = logging.getLogger("mab_demo.llm_prior")
 
 
-def _llm_reasoning(profile: UserProfile, query: str) -> Dict[str, Any]:
-    """模拟 LLM 的链式推理输出（CoT trace）。"""
+# -------------------------- 真实 LLM 路径 -------------------------- #
+def _llm_reasoning_real(profile: UserProfile, query: str) -> Dict[str, Any]:
+    """调用真实大模型, 失败抛异常 (上层捕获后降级)。"""
+    prompt = PRIOR_PROMPT.format(
+        name=profile.name,
+        age=profile.age,
+        gender=profile.gender,
+        annual_income=profile.annual_income,
+        family=profile.family,
+        risk_level=profile.risk_level,
+        holdings=profile.holdings,
+        avg_holding_months=profile.avg_holding_months,
+        query=query,
+    )
+    raw = llm_client.chat_json(
+        prompt=prompt,
+        system=PRIOR_SYSTEM,
+        temperature=0.2,  # 先验生成偏确定性, 低温度
+    )
+    if raw is None:
+        raise RuntimeError("LLM client returned None (network/auth error)")
+    return validate_llm_prior(raw)
+
+
+# -------------------------- Mock 降级路径 -------------------------- #
+def _llm_reasoning_mock(profile: UserProfile, query: str) -> Dict[str, Any]:
+    """常识推理 mock, 保证无 LLM 环境下 demo 完整可跑。"""
     trace = []
     trace.append(f"主诉解析: '{query}' → 场景=子女教育金规划")
     child_age = 5
@@ -25,20 +58,44 @@ def _llm_reasoning(profile: UserProfile, query: str) -> Dict[str, Any]:
     return {
         "cot_trace": trace,
         "priors": {
-            "term_years": {"mu": 15.0, "sigma": 2.0},          # 高斯先验
+            "term_years": {"mu": 15.0, "sigma": 2.0},
             "annual_budget": {"mu": 24_000, "sigma": 6_000},
             "risk": {"R1": 0.55, "R2": 0.35, "R3": 0.08, "R4": 0.02},
         },
     }
 
 
+def _llm_reasoning(profile: UserProfile, query: str, verbose: bool = False):
+    """主入口: 优先真 LLM, 异常回退 mock (并打印降级原因)。"""
+    source = "LLM"
+    if llm_client.enabled:
+        try:
+            out = _llm_reasoning_real(profile, query)
+            return out, source
+        except (SchemaError, Exception) as e:
+            if not CONFIG.fallback_on_fail:
+                raise
+            source = f"Mock (LLM 降级: {type(e).__name__})"
+            log.warning(f"LLM prior failed, fallback to mock: {e}")
+    else:
+        source = "Mock (LLM 未启用)"
+
+    out = _llm_reasoning_mock(profile, query)
+    return out, source
+
+
+# -------------------------- 对外接口 -------------------------- #
 def run(profile: UserProfile, query: str, verbose: bool = True) -> Dict[str, Any]:
     if verbose:
         print("\n┌─[阶段二·算法1] 大模型生成先验分布 (LLM Prior) · 启动 ────────────")
+        print(f"│  Prompt 版本: {VERSION}")
         print(f"│  输入: 静态画像({profile.name}, {profile.age}岁, 年入{profile.annual_income/10000:.0f}万, 5岁子女)")
         print(f"│  主诉: \"{query}\"")
-    out = _llm_reasoning(profile, query)
+
+    out, source = _llm_reasoning(profile, query, verbose=verbose)
+
     if verbose:
+        print(f"│  推理来源: {source}")
         print("│  ── LLM 链式推理 (CoT) ──")
         for step in out["cot_trace"]:
             print(f"│     · {step}")
