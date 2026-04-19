@@ -1,0 +1,5 @@
+# 工业化版本的可选依赖。不安装也能跑 demo(自动降级到 mock/规则/正则)
+# 推荐: pip install -r requirements.txt
+
+# LLM 客户端 (OpenAI 兼容, 支持 DeepSeek / Qwen / vLLM / OpenAI)
+openai>=1.30.0
